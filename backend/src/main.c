@@ -14,7 +14,6 @@
 
 static int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 
-
 typedef enum {
     WAITING_FOR_PLAYER,
     IN_PROGRESS,
@@ -34,7 +33,7 @@ typedef struct {
 } Point;
 
 typedef struct {
-    Point points[5]; // Максимальный корабль - 4 клетки
+    Point points[5];
     int size;
     int hits;
 } Ship;
@@ -54,6 +53,8 @@ typedef struct {
     GameState state;
     int current_player;
     time_t created_at;
+    struct lws *ws1;
+    struct lws *ws2;
 } GameSession;
 
 typedef struct {
@@ -62,10 +63,88 @@ typedef struct {
     pthread_mutex_t mutex;
 } ServerState;
 
+struct connection_info {
+    char *upload_data;
+    size_t upload_data_size;
+};
+
 ServerState server_state;
 
+
+
+json_t* serialize_board(const Board* board) {
+    json_t* board_json = json_object();
+    json_t* cells = json_array();
+    json_t* ships = json_array();
+    
+    for (int y = 0; y < BOARD_SIZE; y++) {
+        json_t* row = json_array();
+        for (int x = 0; x < BOARD_SIZE; x++) {
+            json_array_append_new(row, json_integer(board->cells[y][x]));
+        }
+        json_array_append_new(cells, row);
+    }
+    json_object_set_new(board_json, "cells", cells);
+    
+    for (int i = 0; i < board->ship_count; i++) {
+        json_t* ship_json = json_object();
+        json_object_set_new(ship_json, "size", json_integer(board->ships[i].size));
+        json_object_set_new(ship_json, "hits", json_integer(board->ships[i].hits));
+        
+        json_t* points = json_array();
+        for (int j = 0; j < board->ships[i].size; j++) {
+            json_t* point = json_object();
+            json_object_set_new(point, "x", json_integer(board->ships[i].points[j].x));
+            json_object_set_new(point, "y", json_integer(board->ships[i].points[j].y));
+            json_array_append_new(points, point);
+        }
+        json_object_set_new(ship_json, "points", points);
+        json_array_append_new(ships, ship_json);
+    }
+    json_object_set_new(board_json, "ships", ships);
+    
+    return board_json;
+}
+
+void send_ws_message(struct lws *wsi, const char *message) {
+    if (!wsi) return;
+    
+    unsigned char buf[LWS_PRE + strlen(message)];
+    memcpy(&buf[LWS_PRE], message, strlen(message));
+    lws_write(wsi, &buf[LWS_PRE], strlen(message), LWS_WRITE_TEXT);
+}
+
+void send_game_state(GameSession *session, int player_num) {
+    json_t *response = json_object();
+    json_object_set_new(response, "type", json_string("game_state"));
+    
+    Board *player_board = (player_num == 1) ? &session->board1 : &session->board2;
+    Board *enemy_board = (player_num == 1) ? &session->board2 : &session->board1;
+    
+    json_t *player_board_json = serialize_board(player_board);
+    json_t *enemy_board_json = serialize_board(enemy_board);
+    
+    json_object_set_new(response, "player_board", player_board_json);
+    json_object_set_new(response, "enemy_board", enemy_board_json);
+    json_object_set_new(response, "current_player", json_integer(session->current_player));
+    json_object_set_new(response, "your_player_number", json_integer(player_num));
+    
+    char *response_str = json_dumps(response, JSON_COMPACT);
+    json_decref(response);
+    
+    if (player_num == 1 && session->ws1) {
+        send_ws_message(session->ws1, response_str);
+    } else if (player_num == 2 && session->ws2) {
+        send_ws_message(session->ws2, response_str);
+    }
+    
+    free(response_str);
+}
+
+
+
 void generate_uuid(char *uuid) {
-    const char *chars = "0123456789abcdef";
+    char chars[] = "0123456789abcdef";
     for (int i = 0; i < 36; i++) {
         if (i == 8 || i == 13 || i == 18 || i == 23) {
             uuid[i] = '-';
@@ -158,7 +237,6 @@ int check_hit(Board *board, int x, int y) {
     if (board->cells[y][x] == SHIP) {
         board->cells[y][x] = HIT;
         
-        // Находим корабль и увеличиваем счетчик попаданий
         for (int i = 0; i < board->ship_count; i++) {
             for (int j = 0; j < board->ships[i].size; j++) {
                 if (board->ships[i].points[j].x == x && board->ships[i].points[j].y == y) {
@@ -193,7 +271,6 @@ int is_game_over(Board *board) {
     }
     return 1;
 }
-
 
 
 
@@ -239,7 +316,7 @@ int join_session(GameSession *session, const char *player_name) {
 
 
 
-static struct lws_protocols protocols[] = {
+struct lws_protocols protocols[] = {
     {
         "battleship-protocol",
         callback_battleship,
@@ -247,7 +324,7 @@ static struct lws_protocols protocols[] = {
         4096,
         0, NULL, 0
     },
-    {NULL, NULL, 0, 0, 0, NULL, 0 } // Завершающий элемент
+    {NULL, NULL, 0, 0, 0, NULL, 0 }
 };
 
 /*
@@ -257,7 +334,7 @@ static struct lws_protocols protocols[] = {
     in - input data
     len - input data len
 */
-static int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
+int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
     (void)user;
 
     switch (reason) {
@@ -349,15 +426,90 @@ static int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason
 
                 lws_callback_on_writable_all_protocol(lws_get_context(wsi), &protocols[0]);
                 free(response_str);
+
+                if (session->ws1) send_game_state(session, 1);
+                if (session->ws2) send_game_state(session, 2);
+            } else if (strcmp(type, "join") == 0) {
+                json_t *session_id_json = json_object_get(root, "session_id");
+                json_t *player_name_json = json_object_get(root, "player_name");
+
+                if (!json_is_string(session_id_json) || !json_is_string(player_name_json)) {
+                    json_decref(root);
+                    break;
+                }
+
+                const char *session_id = json_string_value(session_id_json);
+                const char *player_name = json_string_value(player_name_json);
+
+                pthread_mutex_lock(&server_state.mutex);
+                GameSession *session = find_session(session_id);
+                
+                if (session) {
+                    int player_num = 0;
+                    if (strcmp(session->player1, player_name) == 0) {
+                        player_num = 1;
+                        session->ws1 = wsi;
+                    } else if (strcmp(session->player2, player_name) == 0) {
+                        player_num = 2;
+                        session->ws2 = wsi;
+                    }
+                    
+                    if (player_num > 0) {
+                        send_game_state(session, player_num);
+                    }
+                }
+                
+                pthread_mutex_unlock(&server_state.mutex);
+            } else if (strcmp(type, "leave") == 0) {
+                json_t *session_id_json = json_object_get(root, "session_id");
+                const char *session_id = json_string_value(session_id_json);
+                
+                pthread_mutex_lock(&server_state.mutex);
+                GameSession *session = find_session(session_id);
+                if (session) {
+                    session->state = FINISHED;
+                    
+                    json_t *response = json_object();
+                    json_object_set_new(response, "type", json_string("player_left"));
+                    char *response_str = json_dumps(response, JSON_COMPACT);
+                    lws_callback_on_writable_all_protocol(lws_get_context(wsi), &protocols[0]);
+                    free(response_str);
+                }
+                pthread_mutex_unlock(&server_state.mutex);
             }
 
             json_decref(root);
             break;
         }
 
-        case LWS_CALLBACK_CLOSED:
+        case LWS_CALLBACK_CLOSED: {
             printf("WebSocket connection closed\n");
+            pthread_mutex_lock(&server_state.mutex);
+            for (int i = 0; i < server_state.session_count; i++) {
+                GameSession *session = &server_state.sessions[i];
+                if (session->ws1 == wsi) {
+                    session->ws1 = NULL;
+                    if (session->ws2) {
+                        json_t *response = json_object();
+                        json_object_set_new(response, "type", json_string("player_left"));
+                        char *response_str = json_dumps(response, JSON_COMPACT);
+                        send_ws_message(session->ws2, response_str);
+                        free(response_str);
+                    }
+                } else if (session->ws2 == wsi) {
+                    session->ws2 = NULL;
+                    if (session->ws1) {
+                        json_t *response = json_object();
+                        json_object_set_new(response, "type", json_string("player_left"));
+                        char *response_str = json_dumps(response, JSON_COMPACT);
+                        send_ws_message(session->ws1, response_str);
+                        free(response_str);
+                    }
+                }
+            }
+            pthread_mutex_unlock(&server_state.mutex);
             break;
+        }
 
         default:
             break;
@@ -383,13 +535,13 @@ int send_error(struct MHD_Connection *connection, const char *message, int statu
     return ret;
 }
 
-int handle_join_session(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
-    if (*upload_data_size > MHD_MAX_JSON_SIZE) {
+int handle_join_session(struct MHD_Connection *connection, const char *upload_data, size_t upload_data_size) {
+    if (upload_data_size > MHD_MAX_JSON_SIZE) {
         return send_error(connection, "Payload too large", MHD_HTTP_CONTENT_TOO_LARGE);
     }
 
     json_error_t error;
-    json_t *root = json_loadb(upload_data, *upload_data_size, 0, &error);
+    json_t *root = json_loadb(upload_data, upload_data_size, 0, &error);
     if (!root) {
         return send_error(connection, "Invalid JSON", MHD_HTTP_BAD_REQUEST);
     }
@@ -417,29 +569,40 @@ int handle_join_session(struct MHD_Connection *connection, const char *upload_da
 
     json_t *response = json_object();
     json_object_set_new(response, "session_id", json_string(session->id));
-    json_object_set_new(response, "player", json_string("player2"));
+    json_object_set_new(response, "player", json_string("Player 2"));
+    json_object_set_new(response, "board", serialize_board(&session->board2));
 
     char *response_str = json_dumps(response, JSON_COMPACT);
     json_decref(response);
     json_decref(root);
 
-    struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response_str), response_str, MHD_RESPMEM_MUST_FREE);
+    struct MHD_Response *mhd_response = MHD_create_response_from_buffer(
+        strlen(response_str), 
+        (void*)response_str, 
+        MHD_RESPMEM_MUST_FREE
+    );
+
+    if (!mhd_response) {
+        free(response_str);
+        return send_error(connection, "Internal server error", MHD_HTTP_INTERNAL_SERVER_ERROR);
+    }
+
     MHD_add_response_header(mhd_response, "Content-Type", "application/json");
-    MHD_add_response_header(mhd_response, "Connection", "keep-alive");
 
     int ret = MHD_queue_response(connection, MHD_HTTP_OK, mhd_response);
+    
     MHD_destroy_response(mhd_response);
 
     return ret;
 }
 
-int handle_create_session(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
-    if (*upload_data_size > MHD_MAX_JSON_SIZE) {
+int handle_create_session(struct MHD_Connection *connection, const char *upload_data, size_t upload_data_size) {
+    if (upload_data_size > MHD_MAX_JSON_SIZE) {
         return send_error(connection, "Payload too large", MHD_HTTP_CONTENT_TOO_LARGE);
     }
 
     json_error_t error;
-    json_t *root = json_loadb(upload_data, *upload_data_size, 0, &error);
+    json_t *root = json_loadb(upload_data, upload_data_size, 0, &error);
     if (!root) {
         return send_error(connection, "Invalid JSON", MHD_HTTP_BAD_REQUEST);
     }
@@ -463,24 +626,30 @@ int handle_create_session(struct MHD_Connection *connection, const char *upload_
 
     json_t *response = json_object();
     json_object_set_new(response, "session_id", json_string(session->id));
-    json_object_set_new(response, "player", json_string("player1"));
+    json_object_set_new(response, "player", json_string("Player 1"));
+    json_object_set_new(response, "board", serialize_board(&session->board1));
 
     char *response_str = json_dumps(response, JSON_COMPACT);
     json_decref(response);
     json_decref(root);
 
-    struct MHD_Response *mhd_response = MHD_create_response_from_buffer(strlen(response_str), response_str, MHD_RESPMEM_MUST_FREE);
+    struct MHD_Response *mhd_response = MHD_create_response_from_buffer(
+        strlen(response_str), 
+        (void*)response_str, 
+        MHD_RESPMEM_MUST_FREE
+    );
+
+    if (!mhd_response) {
+        free(response_str);
+        return send_error(connection, "Internal server error", MHD_HTTP_INTERNAL_SERVER_ERROR);
+    }
+
     MHD_add_response_header(mhd_response, "Content-Type", "application/json");
-    MHD_add_response_header(mhd_response, "Connection", "keep-alive");
-
-    printf("\nResponse string: %s\n %zu", response_str, strlen(response_str));
-
-    int ret = MHD_queue_response(connection, MHD_HTTP_OK, mhd_response);
-
-    printf("\nret - %d", ret); 
-
-    MHD_destroy_response(mhd_response);
     
+    int ret = MHD_queue_response(connection, MHD_HTTP_OK, mhd_response);
+    
+    MHD_destroy_response(mhd_response);
+
     return ret;
 }
 
@@ -533,35 +702,75 @@ enum MHD_Result http_handler(void *cls, struct MHD_Connection *connection,
     (void)version;
 
     if (*con_cls == NULL) {
-        *con_cls = (void*)1;
-        printf("\nALARM 0");
+        struct connection_info *con_info = malloc(sizeof(struct connection_info));
+    
+        if (!con_info) return MHD_NO;
+
+        con_info->upload_data = NULL;
+        con_info->upload_data_size = 0;
+        *con_cls = con_info;
+
+        if (*upload_data_size) {
+            con_info->upload_data = malloc(*upload_data_size);
+
+            if (!con_info->upload_data) {
+                free(con_info);
+                return MHD_NO;
+            }
+
+            memcpy(con_info->upload_data, upload_data, *upload_data_size);
+            con_info->upload_data_size = *upload_data_size;
+            *upload_data_size = 0;
+        }
+    
         return MHD_YES;
     }
-    
-    if (strcmp(method, "POST") == 0) {
-        if (*upload_data_size != 0) {
-            *upload_data_size = 0;
-            return MHD_YES;
+
+    struct connection_info *con_info = *con_cls;
+
+    if (*upload_data_size) {
+        char *new_data = realloc(con_info->upload_data, con_info->upload_data_size + *upload_data_size);
+
+        if (!new_data) {
+            free(con_info->upload_data);
+            free(con_info);
+            
+            *con_cls = NULL;
+
+            return MHD_NO;
         }
+
+        memcpy(new_data + con_info->upload_data_size, upload_data, *upload_data_size);
+        con_info->upload_data = new_data;
+        con_info->upload_data_size += *upload_data_size;
+        *upload_data_size = 0;
+
+        return MHD_YES;
     }
+
+    enum MHD_Result result = MHD_NO;
 
     if (strcmp(url, "/create") == 0 && strcmp(method, "POST") == 0) {
-        return handle_create_session(connection, upload_data, upload_data_size);
+        result = handle_create_session(connection, con_info->upload_data, con_info->upload_data_size);
     } else if (strcmp(url, "/join") == 0 && strcmp(method, "POST") == 0) {
-        return handle_join_session(connection, upload_data, upload_data_size);
+        result = handle_join_session(connection, con_info->upload_data, con_info->upload_data_size);
     } else if (strcmp(url, "/sessions") == 0 && strcmp(method, "GET") == 0) {
-        return handle_list_sessions(connection);
+        result = handle_list_sessions(connection);
+    } else {
+        result = send_error(connection, "Not Found", MHD_HTTP_NOT_FOUND);
     }
 
-    return send_error(connection, "Not Found", MHD_HTTP_NOT_FOUND);;
+    if (con_info->upload_data) {
+        free(con_info->upload_data);
+    }
+
+    free(con_info);
+    *con_cls = NULL;
+
+    return result;
 }
 
 
-
-
-void connection_done(void *cls, struct MHD_Connection *connection, void **con_cls, enum MHD_RequestTerminationCode code) {
-    printf("\nСоединение закрыто, код завершения: %d\n", code);
-}
 
 int main(int argc, char *argv[]) {
     (void)argc;
@@ -572,17 +781,6 @@ int main(int argc, char *argv[]) {
     pthread_mutex_init(&server_state.mutex, NULL);
     server_state.session_count = 0;
     
-    // HTTP сервер
-    // struct MHD_Daemon *http_daemon = MHD_start_daemon(
-    //     //MHD_USE_SELECT_INTERNALLY, 
-    //     MHD_USE_THREAD_PER_CONNECTION,
-    //     8080, 
-    //     NULL, 
-    //     NULL,
-    //     &http_handler, 
-    //     NULL, 
-    //     MHD_OPTION_END
-    // );
     struct MHD_Daemon *http_daemon = MHD_start_daemon(
         MHD_USE_THREAD_PER_CONNECTION, 
         8080, 
@@ -592,8 +790,6 @@ int main(int argc, char *argv[]) {
         NULL, 
         MHD_OPTION_CONNECTION_TIMEOUT, 
         10, 
-        MHD_OPTION_NOTIFY_COMPLETED, 
-        &connection_done, 
         NULL, 
         MHD_OPTION_END
     );
