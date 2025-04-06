@@ -18,7 +18,7 @@ public:
 private slots:
     void showGameWidget(const QString &sessionId, const QString &playerName);
     void handleCreateSession(const QString &playerName);
-    void handleJoinSession(const QString &playerName);
+    void handleJoinSession(const QString &sessionId, const QString &playerName);
 
 private:
     QNetworkAccessManager *networkManager;

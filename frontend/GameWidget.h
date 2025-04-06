@@ -39,6 +39,7 @@ private:
     QString currentPlayerName;
     int currentPlayerNumber;
     bool isMyTurn;
+    bool isGameStarted;
 
     QLabel *statusLabel;
     QPushButton *backButton;

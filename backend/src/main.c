@@ -36,6 +36,7 @@ typedef struct {
     Point points[5];
     int size;
     int hits;
+    int is_horizontal;
 } Ship;
 
 typedef struct {
@@ -192,6 +193,7 @@ void place_ship(Board *board, int x, int y, int size, int horizontal) {
     Ship *ship = &board->ships[board->ship_count++];
     ship->size = size;
     ship->hits = 0;
+    ship->is_horizontal = horizontal;
     
     if (horizontal) {
         for (int i = 0; i < size; i++) {
@@ -253,14 +255,47 @@ int check_hit(Board *board, int x, int y) {
 }
 
 int is_ship_sunk(Board *board, int x, int y) {
-    for (int i = 0; i < board->ship_count; i++) {
+   for (int i = 0; i < board->ship_count; i++) {
         for (int j = 0; j < board->ships[i].size; j++) {
             if (board->ships[i].points[j].x == x && board->ships[i].points[j].y == y) {
-                return board->ships[i].hits == board->ships[i].size;
+                if (board->ships[i].hits == board->ships[i].size) {
+                    return i;    
+                }
             }
         }
     }
-    return 0;
+
+    return -1;
+}
+
+void sunk_the_ship(Board* board, int sunked_ship_ind) {
+    if (sunked_ship_ind > -1) {
+        int size = board->ships[sunked_ship_ind].size;
+        int start_y = board->ships[sunked_ship_ind].points[0].y;
+        int start_x = board->ships[sunked_ship_ind].points[0].x;
+
+        if (board->ships[sunked_ship_ind].is_horizontal) {
+            for (int x = start_x - 1; x < start_x + size + 1; x++) {
+                if (x < 0 || x >= BOARD_SIZE) continue;
+
+                for (int y = start_y - 1; y < start_y + 2; y++) {
+                    if (y < 0 || y >= BOARD_SIZE || board->cells[y][x] == HIT) continue;
+
+                    board->cells[y][x] = MISS;
+                }
+            }
+        } else {
+            for (int y = start_y - 1; y < start_y + size + 1; y++) {
+                if (y < 0 || y >= BOARD_SIZE) continue;
+
+                for (int x = start_x - 1; x < start_x + 2; x++) {
+                    if (x < 0 || x >= BOARD_SIZE || board->cells[y][x] == HIT) continue;
+
+                    board->cells[y][x] = MISS;
+                }
+            }
+        }
+    }
 }
 
 int is_game_over(Board *board) {
@@ -347,15 +382,14 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
             printf("Received message: %.*s\n", (int)len, message);
 
             json_error_t error;
-            json_t *root = json_loadb(message, len, 0, &error);
 
+            json_t *root = json_loadb(message, len, 0, &error);
             if (!root) {
                 printf("JSON parse error: %s\n", error.text);
                 break;
             }
 
             json_t *type_json = json_object_get(root, "type");
-
             if (!json_is_string(type_json)) {
                 json_decref(root);
                 break;
@@ -377,6 +411,7 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                 int y = json_integer_value(y_json);
 
                 pthread_mutex_lock(&server_state.mutex);
+                
                 GameSession *session = find_session(session_id);
 
                 if (!session || session->state != IN_PROGRESS) {
@@ -386,6 +421,7 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                 }
 
                 const char *player_name = (const char *)lws_wsi_user(wsi);
+
                 int is_player1 = player_name && strcmp(player_name, session->player1) == 0;
                 int is_player2 = player_name && strcmp(player_name, session->player2) == 0;
 
@@ -397,38 +433,41 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
 
                 Board *target_board = (session->current_player == 1) ? &session->board2 : &session->board1;
                 int hit = check_hit(target_board, x, y);
-                int sunk = 0;
+                int sunked_ship_ind = -1;
                 
                 if (hit) {
-                    sunk = is_ship_sunk(target_board, x, y);
-                }
+                    sunked_ship_ind = is_ship_sunk(target_board, x, y);
 
-                int game_over = is_game_over(target_board);
-                
-                if (game_over) {
-                    session->state = FINISHED;
-                } else if (!hit) {
+                    if (sunked_ship_ind != -1) {
+                        sunk_the_ship(target_board, sunked_ship_ind);
+                    }
+                } else {
                     session->current_player = (session->current_player == 1) ? 2 : 1;
                 }
 
-                json_t *response = json_object();
-                json_object_set_new(response, "type", json_string("attack_result"));
-                json_object_set_new(response, "x", json_integer(x));
-                json_object_set_new(response, "y", json_integer(y));
-                json_object_set_new(response, "hit", json_boolean(hit));
-                json_object_set_new(response, "sunk", json_boolean(sunk));
-                json_object_set_new(response, "game_over", json_boolean(game_over));
-                json_object_set_new(response, "next_player", json_integer(session->current_player));
+                if (is_game_over(target_board)) {
+                    session->state = FINISHED;
 
-                char *response_str = json_dumps(response, JSON_COMPACT);
-                json_decref(response);
-                pthread_mutex_unlock(&server_state.mutex);
+                    pthread_mutex_unlock(&server_state.mutex);
 
-                lws_callback_on_writable_all_protocol(lws_get_context(wsi), &protocols[0]);
-                free(response_str);
-
-                if (session->ws1) send_game_state(session, 1);
-                if (session->ws2) send_game_state(session, 2);
+                    json_t *game_over_msg = json_object();
+                    json_object_set_new(game_over_msg, "type", json_string("attack_result"));
+                    json_object_set_new(game_over_msg, "game_over", json_boolean(true));
+                    json_object_set_new(game_over_msg, "next_player", json_integer(session->current_player));
+                    
+                    char *game_over_str = json_dumps(game_over_msg, JSON_COMPACT);
+                    
+                    if (session->ws1) send_ws_message(session->ws1, game_over_str);
+                    if (session->ws2) send_ws_message(session->ws2, game_over_str);
+                    
+                    free(game_over_str);
+                    json_decref(game_over_msg);
+                } else {
+                    pthread_mutex_unlock(&server_state.mutex);
+                
+                    if (session->ws1) send_game_state(session, 1);
+                    if (session->ws2) send_game_state(session, 2);
+                }
             } else if (strcmp(type, "join") == 0) {
                 json_t *session_id_json = json_object_get(root, "session_id");
                 json_t *player_name_json = json_object_get(root, "player_name");
@@ -442,6 +481,7 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                 const char *player_name = json_string_value(player_name_json);
 
                 pthread_mutex_lock(&server_state.mutex);
+
                 GameSession *session = find_session(session_id);
                 
                 if (session) {
@@ -449,10 +489,15 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                     if (strcmp(session->player1, player_name) == 0) {
                         player_num = 1;
                         session->ws1 = wsi;
+                        lws_set_wsi_user(wsi, (void *)session->player1);
                     } else if (strcmp(session->player2, player_name) == 0) {
                         player_num = 2;
                         session->ws2 = wsi;
+                        lws_set_wsi_user(wsi, (void *)session->player2);
                     }
+                    
+                    printf("\nJOPA %s", (const char *)lws_wsi_user(wsi));
+                    fflush(stdout);
                     
                     if (player_num > 0) {
                         send_game_state(session, player_num);
@@ -484,7 +529,9 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
 
         case LWS_CALLBACK_CLOSED: {
             printf("WebSocket connection closed\n");
+
             pthread_mutex_lock(&server_state.mutex);
+            
             for (int i = 0; i < server_state.session_count; i++) {
                 GameSession *session = &server_state.sessions[i];
                 if (session->ws1 == wsi) {
@@ -492,8 +539,11 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                     if (session->ws2) {
                         json_t *response = json_object();
                         json_object_set_new(response, "type", json_string("player_left"));
+
                         char *response_str = json_dumps(response, JSON_COMPACT);
+                        
                         send_ws_message(session->ws2, response_str);
+
                         free(response_str);
                     }
                 } else if (session->ws2 == wsi) {
@@ -501,12 +551,16 @@ int callback_battleship(struct lws *wsi, enum lws_callback_reasons reason, void 
                     if (session->ws1) {
                         json_t *response = json_object();
                         json_object_set_new(response, "type", json_string("player_left"));
+
                         char *response_str = json_dumps(response, JSON_COMPACT);
+
                         send_ws_message(session->ws1, response_str);
+
                         free(response_str);
                     }
                 }
             }
+            
             pthread_mutex_unlock(&server_state.mutex);
             break;
         }
@@ -539,7 +593,7 @@ int handle_join_session(struct MHD_Connection *connection, const char *upload_da
     if (upload_data_size > MHD_MAX_JSON_SIZE) {
         return send_error(connection, "Payload too large", MHD_HTTP_CONTENT_TOO_LARGE);
     }
-
+    
     json_error_t error;
     json_t *root = json_loadb(upload_data, upload_data_size, 0, &error);
     if (!root) {

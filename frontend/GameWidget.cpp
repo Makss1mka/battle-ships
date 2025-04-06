@@ -62,6 +62,8 @@ void GameWidget::setupBoard(QGridLayout *layout, bool isEnemy) {
 }
 
 void GameWidget::joinGame(const QString &sessionId, const QString &playerName) {
+    leaveGame();
+
     currentSessionId = sessionId;
     currentPlayerName = playerName;
 
@@ -78,12 +80,25 @@ void GameWidget::joinGame(const QString &sessionId, const QString &playerName) {
 }
 
 void GameWidget::leaveGame() {
-    if (webSocket && webSocket->state() == QAbstractSocket::ConnectedState) {
-        QJsonObject message;
-        message["type"] = "leave";
-        message["session_id"] = currentSessionId;
-        webSocket->sendTextMessage(QJsonDocument(message).toJson());
+    if (webSocket) {
+        disconnect(webSocket, nullptr, this, nullptr);
+
+        if (webSocket->state() == QAbstractSocket::ConnectedState) {
+            QJsonObject message;
+            message["type"] = "leave";
+            message["session_id"] = currentSessionId;
+            webSocket->sendTextMessage(QJsonDocument(message).toJson());
+
+            webSocket->close(QWebSocketProtocol::CloseCodeNormal);
+        }
+        webSocket->deleteLater();
+        webSocket = nullptr;
     }
+
+    currentSessionId.clear();
+    currentPlayerName.clear();
+    currentPlayerNumber = 0;
+    isMyTurn = false;
 }
 
 void GameWidget::onWebSocketConnected() {
@@ -114,14 +129,23 @@ void GameWidget::onWebSocketMessageReceived(const QString &message) {
         isMyTurn = (json["current_player"].toInt() == currentPlayerNumber);
         updateBoards(json);
         statusLabel->setText(isMyTurn ? "Ваш ход" : "Ход противника");
-    }
-    else if (type == "player_left") {
+    } else if (type == "player_left") {
         showGameResult("Партия прервана, игрок вышел");
+    } else if (type == "attack_result") {
+        bool game_over = json["game_over"].toBool();
+        if (game_over) {
+            QString winner;
+            if (currentPlayerNumber == json["next_player"].toInt()) {
+                winner = "Вы выиграли!";
+            } else {
+                winner = QString("Игрок %1 выиграл! Вы проиграли :(").arg(currentPlayerName);
+            }
+            showGameResult(winner);
+        }
     }
 }
 
 void GameWidget::updateBoards(const QJsonObject &gameState) {
-    // Player board
     QJsonObject playerBoard = gameState["player_board"].toObject();
     QJsonArray cells = playerBoard["cells"].toArray();
 
@@ -133,16 +157,15 @@ void GameWidget::updateBoards(const QJsonObject &gameState) {
 
             QString style;
             switch (cellState) {
-            case 0: style = "background-color: blue;"; break;  // EMPTY
-            case 1: style = "background-color: gray;"; break;  // SHIP
-            case 2: style = "background-color: red;"; break;   // HIT
-            case 3: style = "background-color: white;"; break; // MISS
+                case 0: style = "background-color: blue;"; break;       // EMPTY
+                case 1: style = "background-color: gray;"; break;       // SHIP
+                case 2: style = "background-color: red;"; break;        // HIT
+                case 3: style = "background-color: white;"; break;      // MISS
             }
             button->setStyleSheet(style);
         }
     }
 
-    // Enemy board
     QJsonObject enemyBoard = gameState["enemy_board"].toObject();
     cells = enemyBoard["cells"].toArray();
 
@@ -154,9 +177,9 @@ void GameWidget::updateBoards(const QJsonObject &gameState) {
 
             QString style;
             switch (cellState) {
-            case 2: style = "background-color: red;"; break;   // HIT
-            case 3: style = "background-color: white;"; break; // MISS
-            default: style = "background-color: blue;"; break; // EMPTY or SHIP (не показываем)
+                case 2: style = "background-color: red;"; break;        // HIT
+                case 3: style = "background-color: white;"; break;      // MISS
+                default: style = "background-color: blue;"; break;      // EMPTY or SHIP (не показываем)
             }
             button->setStyleSheet(style);
         }
@@ -181,7 +204,8 @@ void GameWidget::onCellClicked(int row, int col) {
 
 void GameWidget::showGameResult(const QString &result) {
     QMessageBox::information(this, "Игра окончена", result);
-    disableBoards();
+    //disableBoards();
+    leaveGame();
     emit backToSessions();
 }
 
